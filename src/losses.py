@@ -579,3 +579,90 @@ class LabelSmoothingCrossEntropy(nn.Module):
         smooth_loss = -logprobs.mean(dim=-1)
         loss = self.confidence * nll_loss + self.smoothing * smooth_loss
         return loss.mean()
+
+# モダンな深層距離学習 (deep metric learning) 手法: SphereFace, CosFace, ArcFace
+# https://qiita.com/yu4u/items/078054dfb5592cbb80cc
+class ArcMarginProduct(nn.Module):
+    """Implement of large margin arc distance: :
+        Args:
+            in_features: size of each input sample
+            out_features: size of each output sample
+            s: norm of input feature
+            m: margin
+            cos(theta + m)
+    """
+    def __init__(self, in_features, out_features, s=30.0, 
+                 m=0.50, easy_margin=False, ls_eps=0.0):
+        super(ArcMarginProduct, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.ls_eps = ls_eps  # label smoothing
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+        self.easy_margin = easy_margin
+        self.cos_m = math.cos(m) # 0.8775825618903728
+        self.sin_m = math.sin(m) # 0.479425538604203
+        self.th = math.cos(math.pi - m) # -0.8775825618903726
+        self.mm = math.sin(math.pi - m) * m # 0.23971276930210156
+
+    def forward(self, input, label):
+        # --------------------------- cos(theta) & phi(theta) ---------------------
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight)) # (batch, embedding) -> (batch, output_length)
+        sine = torch.sqrt(1.0 - torch.pow(cosine, 2))
+        phi = cosine * self.cos_m - sine * self.sin_m # (batch, output_length)
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+        # --------------------------- convert label to one-hot ---------------------
+        # one_hot = torch.zeros(cosine.size(), requires_grad=True, device='cuda')
+        one_hot = torch.zeros(cosine.size(), device=device)
+        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+        if self.ls_eps > 0:
+            one_hot = (1 - self.ls_eps) * one_hot + self.ls_eps / self.out_features
+        # -------------torch.where(out_i = {x_i if condition_i else y_i) ------------
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output *= self.s
+
+        return output
+
+# Copied and modified from
+# https://github.com/ChristofHenkel/kaggle-landmark-2021-1st-place/blob/034a7d8665bb4696981698348c9370f2d4e61e35/models/ch_mdl_dolg_efficientnet.py
+class ArcMarginProductSubcenter(nn.Module):
+    def __init__(self, in_features: int, out_features: int, k: int = 3):
+        super().__init__()
+        self.weight = nn.Parameter(torch.FloatTensor(out_features * k, in_features))
+        self.reset_parameters()
+        self.k = k
+        self.out_features = out_features
+
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        cosine_all = F.linear(F.normalize(features), F.normalize(self.weight))
+        cosine_all = cosine_all.view(-1, self.out_features, self.k)
+        cosine, _ = torch.max(cosine_all, dim=2)
+        return cosine
+
+class GeM(nn.Module):
+    def __init__(self, p=3, eps=1e-6):
+        super(GeM, self).__init__()
+        self.p = nn.Parameter(torch.ones(1)*p)
+        self.eps = eps
+
+    def forward(self, x):
+        return self.gem(x, p=self.p, eps=self.eps)
+        
+    def gem(self, x, p=3, eps=1e-6):
+        return F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1./p)
+        
+    def __repr__(self):
+        return self.__class__.__name__ + \
+                '(' + 'p=' + '{:.4f}'.format(self.p.data.tolist()[0]) + \
+                ', ' + 'eps=' + str(self.eps) + ')'
+
